@@ -1,0 +1,21 @@
+[project]
+name = "stack-submit"
+version = "0.1.0"
+description = "Submit each commit of a stack as a pull request in a native GitHub stack"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+stack-submit = "stack_submit.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/sean-roelofs-ai/stack-submit"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 120
