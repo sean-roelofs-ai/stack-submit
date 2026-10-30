@@ -157,30 +157,67 @@ def write_stack_info(commits: list[Commit]) -> None:
         run("git", "hook", "run", "--ignore-missing", f"--to-stdin={f.name}", "post-rewrite", "--", "rebase")
 
 
-def sync_github_stack(commits: list[Commit], bases: list[str]) -> None:
+def find_github_stack(commits: list[Commit]) -> dict | None:
+    """The native GitHub stack holding any of the already-submitted PRs."""
+    for c in commits:
+        if c.pr_url:
+            stacks = json.loads(run("gh", "api", f"repos/{{owner}}/{{repo}}/stacks?pull_request={c.pr_number}"))
+            if stacks:
+                return stacks[0]
+    return None
+
+
+def prepare_github_stack(commits: list[Commit], bases: list[str], target: str) -> dict | None:
+    """Unstack and retarget PRs whose base changes, before anything is pushed.
+
+    GitHub marks a PR as merged once its base branch contains its head. After a
+    reorder, the push can do exactly that to a PR's old base (e.g. A,B -> B,A makes
+    A's branch contain B while B's PR still targets it), so every PR whose base will
+    change is first moved onto the target branch, which never contains the stack.
+    Bases can't be edited inside a native stack, so the stack is dissolved first
+    unless it only grows at the top.
+
+    Returns the existing stack if it can be extended, else None.
+    """
+    stack = find_github_stack(commits)
+    start = 0
+    if stack:
+        stacked = [p["number"] for p in stack["pull_requests"]]
+        ours = [c.pr_number if c.pr_url else None for c in commits]
+        if stacked == ours[: len(stacked)]:
+            start = len(stacked)
+        else:
+            print(f"Unstacking stack #{stack['number']}")
+            run("gh", "api", "-X", "POST", f"repos/{{owner}}/{{repo}}/stacks/{stack['number']}/unstack")
+            stack = None
+
+    def retarget(commit: Commit, base: str) -> None:
+        if commit.pr_url is None:
+            return
+        pr = json.loads(run("gh", "pr", "view", str(commit.pr_number), "--json", "baseRefName"))
+        if pr["baseRefName"] not in (base, target):
+            print(f"Retargeting {commit.pr_url} to {target}")
+            run("gh", "pr", "edit", str(commit.pr_number), "--base", target)
+
+    with ThreadPoolExecutor() as pool:
+        list(pool.map(retarget, commits[start:], bases[start:]))
+    return stack
+
+
+def sync_github_stack(commits: list[Commit], bases: list[str], stack: dict | None) -> None:
     """Fix PR bases/titles/bodies and make the PRs one native GitHub stack."""
     prs = [c.pr_number for c in commits]
-    stacks = json.loads(run("gh", "api", f"repos/{{owner}}/{{repo}}/stacks?pull_request={prs[0]}"))
-    existing = stacks[0] if stacks else None
-    existing_prs = [p["number"] for p in existing["pull_requests"]] if existing else []
-
-    # A stack can only grow at the top; anything else (reorder, drop) means rebuilding it.
-    rebuild = existing_prs != prs[: len(existing_prs)]
-    if existing and rebuild:
-        print(f"Unstacking stack #{existing['number']}")
-        run("gh", "api", "-X", "POST", f"repos/{{owner}}/{{repo}}/stacks/{existing['number']}/unstack")
-
     print(f"Syncing {len(commits)} PRs")
     with ThreadPoolExecutor() as pool:
         list(pool.map(update_pr, commits, bases))
 
     if len(prs) < 2:
         return
-    if existing and not rebuild:
-        new_prs = prs[len(existing_prs) :]
+    if stack:
+        new_prs = prs[len(stack["pull_requests"]) :]
         if new_prs:
-            gh_post(f"repos/{{owner}}/{{repo}}/stacks/{existing['number']}/add", new_prs)
-        print(f"Stack #{existing['number']}: {commits[-1].pr_url}")
+            gh_post(f"repos/{{owner}}/{{repo}}/stacks/{stack['number']}/add", new_prs)
+        print(f"Stack #{stack['number']}: {commits[-1].pr_url}")
     else:
         number = gh_post("repos/{owner}/{repo}/stacks", prs)
         print(f"Created stack #{number}: {commits[-1].pr_url}")
@@ -208,6 +245,7 @@ def main() -> None:
         sys.exit(f"Nothing to submit: HEAD is already in {args.remote}/{target}")
     bases = [target] + [c.branch for c in commits[:-1]]
 
+    stack = prepare_github_stack(commits, bases, target)
     push(commits, args.remote, args.no_verify)
     new = [(c, base) for c, base in zip(commits, bases) if c.pr_url is None]
     for c, base in new:  # in order, so each base branch has its PR before the next
@@ -216,7 +254,7 @@ def main() -> None:
         write_stack_info(commits)
         push(commits, args.remote, args.no_verify)
 
-    sync_github_stack(commits, bases)
+    sync_github_stack(commits, bases, stack)
 
 
 if __name__ == "__main__":
