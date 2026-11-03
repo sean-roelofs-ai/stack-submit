@@ -103,7 +103,13 @@ def create_pr(commit: Commit, base: str, draft: bool) -> None:
     print(f"Created {commit.pr_url}")
 
 
-def update_pr(commit: Commit, base: str) -> None:
+def pr_body(commit: Commit, commits: list[Commit]) -> str:
+    """The commit body plus a list of the stack's PRs (top first), in the same format as stack-pr."""
+    lines = [f" * {'__->__' if c is commit else ''}#{c.pr_number}" for c in reversed(commits)]
+    return f"{commit.body}\n\nStacked PRs:\n" + "\n".join(lines)
+
+
+def update_pr(commit: Commit, base: str, body: str) -> None:
     """Make the PR's base, title and body match the stack, editing only what differs.
 
     GitHub rejects any `--base` on a stacked PR, even an unchanged one.
@@ -114,10 +120,10 @@ def update_pr(commit: Commit, base: str) -> None:
         edits += ["--base", base]
     if pr["title"] != commit.title:
         edits += ["--title", commit.title]
-    if pr["body"].strip() != commit.body:
+    if pr["body"].strip() != body.strip():
         edits += ["--body-file", "-"]
     if edits:
-        run("gh", "pr", "edit", str(commit.pr_number), *edits, input=commit.body)
+        run("gh", "pr", "edit", str(commit.pr_number), *edits, input=body)
 
 
 def write_stack_info(commits: list[Commit]) -> None:
@@ -205,11 +211,11 @@ def prepare_github_stack(commits: list[Commit], bases: list[str], target: str) -
 
 
 def sync_github_stack(commits: list[Commit], bases: list[str], stack: dict | None) -> None:
-    """Fix PR bases/titles/bodies and make the PRs one native GitHub stack."""
+    """Fix PR bases, titles and bodies (with links to the other PRs), and make the PRs one native GitHub stack."""
     prs = [c.pr_number for c in commits]
     print(f"Syncing {len(commits)} PRs")
     with ThreadPoolExecutor() as pool:
-        list(pool.map(update_pr, commits, bases))
+        list(pool.map(update_pr, commits, bases, [pr_body(c, commits) for c in commits]))
 
     if len(prs) < 2:
         return

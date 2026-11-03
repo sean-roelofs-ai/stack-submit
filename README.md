@@ -35,7 +35,8 @@ For each commit, bottom to top, it:
    This is the same format as [stack-pr](https://github.com/modular/stack-pr), so existing stack-pr stacks
    are picked up as-is. Messages are rewritten with `git commit-tree` (the working copy is never touched),
    and `post-rewrite` hooks run so tools like git-branchless follow the rewrite.
-4. Sets each PR's base to the branch below it and its title/body to the commit message.
+4. Sets each PR's base to the branch below it, its title and body to the commit message, and appends a
+   `Stacked PRs:` list linking every PR in the stack (same format as stack-pr).
    The commit message is the source of truth: edits to the PR description on GitHub are overwritten.
 5. Links the PRs into a GitHub stack, extending the existing stack if PRs were added on top,
    or rebuilding it if the stack was reordered or a commit was dropped.
