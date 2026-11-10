@@ -163,14 +163,15 @@ def write_stack_info(commits: list[Commit]) -> None:
         run("git", "hook", "run", "--ignore-missing", f"--to-stdin={f.name}", "post-rewrite", "--", "rebase")
 
 
-def find_github_stack(commits: list[Commit]) -> dict | None:
-    """The native GitHub stack holding any of the already-submitted PRs."""
-    for c in commits:
-        if c.pr_url:
-            stacks = json.loads(run("gh", "api", f"repos/{{owner}}/{{repo}}/stacks?pull_request={c.pr_number}"))
-            if stacks:
-                return stacks[0]
-    return None
+def find_github_stacks(commits: list[Commit]) -> list[dict]:
+    """Every native GitHub stack holding any of the already-submitted PRs. After a reorder
+    or a partial submit the PRs can be spread over several stacks."""
+    def lookup(c: Commit) -> list[dict]:
+        return json.loads(run("gh", "api", f"repos/{{owner}}/{{repo}}/stacks?pull_request={c.pr_number}"))
+
+    with ThreadPoolExecutor() as pool:
+        found = pool.map(lookup, [c for c in commits if c.pr_url])
+        return list({s["number"]: s for stacks in found for s in stacks}.values())
 
 
 def prepare_github_stack(commits: list[Commit], bases: list[str], target: str) -> dict | None:
@@ -185,17 +186,15 @@ def prepare_github_stack(commits: list[Commit], bases: list[str], target: str) -
 
     Returns the existing stack if it can be extended, else None.
     """
-    stack = find_github_stack(commits)
-    start = 0
-    if stack:
-        stacked = [p["number"] for p in stack["pull_requests"]]
-        ours = [c.pr_number if c.pr_url else None for c in commits]
-        if stacked == ours[: len(stacked)]:
-            start = len(stacked)
-        else:
-            print(f"Unstacking stack #{stack['number']}")
-            run("gh", "api", "-X", "POST", f"repos/{{owner}}/{{repo}}/stacks/{stack['number']}/unstack")
-            stack = None
+    stacks = find_github_stacks(commits)
+    ours = [c.pr_number if c.pr_url else None for c in commits]
+    stack, start = None, 0
+    if len(stacks) == 1 and [p["number"] for p in stacks[0]["pull_requests"]] == ours[: len(stacks[0]["pull_requests"])]:
+        stack, start = stacks[0], len(stacks[0]["pull_requests"])
+    else:
+        for s in stacks:  # any stack left behind would block editing its PRs' bases
+            print(f"Unstacking stack #{s['number']}")
+            run("gh", "api", "-X", "POST", f"repos/{{owner}}/{{repo}}/stacks/{s['number']}/unstack")
 
     def retarget(commit: Commit, base: str) -> None:
         if commit.pr_url is None:
