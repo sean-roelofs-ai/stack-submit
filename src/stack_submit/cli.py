@@ -4,6 +4,11 @@ The link between a commit and its PR lives in the commit message, in the same
 format stack-pr uses, so existing stack-pr stacks keep working:
 
     stack-info: PR: https://github.com/owner/repo/pull/123, branch: user/stack/abc123
+
+To fold a commit into the PR below it instead of giving it its own PR, replace its
+stack-info line with a bare:
+
+    stack-info:
 """
 
 from __future__ import annotations
@@ -19,22 +24,38 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 STACK_INFO_RE = re.compile(r"^stack-info: PR: (\S+), branch: (\S+)$", re.MULTILINE)
+# Written by hand (never by this tool): any other stack-info line, e.g. a bare `stack-info:`,
+# makes the commit continue the PR below it.
+CONTINUATION_RE = re.compile(r"^stack-info:(?![ \t]*PR:).*$", re.MULTILINE)
 
 
 @dataclass
 class Commit:
     sha: str
     message: str
+
+
+@dataclass
+class Pr:
+    """A PR and its commits, bottom first. The first commit holds the PR's title, body and
+    stack-info line; any later ones are marked with a bare `stack-info:`."""
+
+    commits: list[Commit]
     pr_url: str | None
     branch: str
 
     @property
+    def head(self) -> str:
+        """The commit the PR's branch points at."""
+        return self.commits[-1].sha
+
+    @property
     def title(self) -> str:
-        return self.message.splitlines()[0]
+        return self.commits[0].message.splitlines()[0]
 
     @property
     def body(self) -> str:
-        body = "\n".join(self.message.splitlines()[1:])
+        body = "\n".join(self.commits[0].message.splitlines()[1:])
         return STACK_INFO_RE.sub("", body).strip()
 
     @property
@@ -61,92 +82,90 @@ def default_target(remote: str) -> str:
     return ref.removeprefix(f"refs/remotes/{remote}/")
 
 
-def read_stack(remote: str, target: str, prefix: str) -> list[Commit]:
-    """Commits in `<remote>/<target>..HEAD`, bottom first."""
+def read_stack(remote: str, target: str, prefix: str) -> list[Pr]:
+    """The PRs for the commits in `<remote>/<target>..HEAD`, bottom first."""
     if run("git", "rev-list", "--merges", f"{remote}/{target}..HEAD"):
         sys.exit("error: the stack contains merge commits")
     log = run("git", "log", "--reverse", "--format=%H%x00%B%x1e", f"{remote}/{target}..HEAD")
-    commits = []
+    prs: list[Pr] = []
     for entry in filter(None, (e.strip("\n") for e in log.split("\x1e"))):
         sha, message = entry.split("\x00", 1)
+        commit = Commit(sha, message.strip())
         match = STACK_INFO_RE.search(message)
-        if match:
-            commits.append(Commit(sha, message.strip(), pr_url=match[1], branch=match[2]))
+        if CONTINUATION_RE.search(message):
+            if match:
+                sys.exit(f"error: commit {sha[:10]} has both a bare `stack-info:` and a PR stack-info line")
+            if not prs:
+                sys.exit(f"error: commit {sha[:10]} has a bare `stack-info:` but no PR below it to continue")
+            prs[-1].commits.append(commit)
+        elif match:
+            prs.append(Pr([commit], pr_url=match[1], branch=match[2]))
         else:
             # Name new branches after the original commit; the name is stored in the
             # message below, so it stays stable when the commit is later rewritten.
-            commits.append(Commit(sha, message.strip(), pr_url=None, branch=f"{prefix}/{sha[:10]}"))
-    return commits
+            prs.append(Pr([commit], pr_url=None, branch=f"{prefix}/{sha[:10]}"))
+    return prs
 
 
-def push(commits: list[Commit], remote: str, no_verify: bool) -> None:
-    print(f"Pushing {len(commits)} branches")
-    refspecs = [f"{c.sha}:refs/heads/{c.branch}" for c in commits]
+def push(prs: list[Pr], remote: str, no_verify: bool) -> None:
+    print(f"Pushing {len(prs)} branches")
+    refspecs = [f"{p.head}:refs/heads/{p.branch}" for p in prs]
     run("git", "push", "--atomic", "--force", *(["--no-verify"] if no_verify else []), remote, *refspecs)
 
 
-def create_pr(commit: Commit, base: str, draft: bool) -> None:
+def create_pr(pr: Pr, base: str, draft: bool) -> None:
     # Reuse an open PR for this branch, e.g. when the commit lost its stack-info line.
     existing = subprocess.run(
-        ["gh", "pr", "view", commit.branch, "--json", "url,state"], capture_output=True, text=True
+        ["gh", "pr", "view", pr.branch, "--json", "url,state"], capture_output=True, text=True
     )
     if existing.returncode == 0 and json.loads(existing.stdout)["state"] == "OPEN":
-        commit.pr_url = json.loads(existing.stdout)["url"]
-        print(f"Found {commit.pr_url}")
+        pr.pr_url = json.loads(existing.stdout)["url"]
+        print(f"Found {pr.pr_url}")
         return
     out = run(
-        "gh", "pr", "create", "--base", base, "--head", commit.branch,
-        "--title", commit.title, "--body-file", "-", *(["--draft"] if draft else []),
-        input=commit.body,
+        "gh", "pr", "create", "--base", base, "--head", pr.branch,
+        "--title", pr.title, "--body-file", "-", *(["--draft"] if draft else []),
+        input=pr.body,
     )  # fmt: skip
-    commit.pr_url = out.splitlines()[-1]
-    print(f"Created {commit.pr_url}")
+    pr.pr_url = out.splitlines()[-1]
+    print(f"Created {pr.pr_url}")
 
 
-def pr_body(commit: Commit, commits: list[Commit]) -> str:
-    """The commit body plus a list of the stack's PRs (top first), in the same format as stack-pr."""
-    lines = [f" * {'__->__' if c is commit else ''}#{c.pr_number}" for c in reversed(commits)]
-    return f"{commit.body}\n\nStacked PRs:\n" + "\n".join(lines)
+def pr_body(pr: Pr, prs: list[Pr]) -> str:
+    """The PR's commit body plus a list of the stack's PRs (top first), in the same format as stack-pr."""
+    lines = [f" * {'__->__' if p is pr else ''}#{p.pr_number}" for p in reversed(prs)]
+    return f"{pr.body}\n\nStacked PRs:\n" + "\n".join(lines)
 
 
-def update_pr(commit: Commit, base: str, body: str) -> None:
+def update_pr(pr: Pr, base: str, body: str) -> None:
     """Make the PR's base, title and body match the stack, editing only what differs.
 
     GitHub rejects any `--base` on a stacked PR, even an unchanged one.
     """
-    pr = json.loads(run("gh", "pr", "view", str(commit.pr_number), "--json", "baseRefName,title,body"))
+    info = json.loads(run("gh", "pr", "view", str(pr.pr_number), "--json", "baseRefName,title,body"))
     edits = []
-    if pr["baseRefName"] != base:
+    if info["baseRefName"] != base:
         edits += ["--base", base]
-    if pr["title"] != commit.title:
-        edits += ["--title", commit.title]
-    if pr["body"].strip() != body.strip():
+    if info["title"] != pr.title:
+        edits += ["--title", pr.title]
+    if info["body"].strip() != body.strip():
         edits += ["--body-file", "-"]
     if edits:
-        run("gh", "pr", "edit", str(commit.pr_number), *edits, input=body)
+        run("gh", "pr", "edit", str(pr.pr_number), *edits, input=body)
 
 
-def write_stack_info(commits: list[Commit]) -> None:
+def write_stack_info(prs: list[Pr]) -> None:
     """Add missing `stack-info` lines by rebuilding the commits with `git commit-tree`.
 
     Trees are unchanged, so the working copy and index are never touched.
     """
     rewritten = []  # (old sha, new sha) pairs for the post-rewrite hook
-    parent = run("git", "rev-parse", f"{commits[0].sha}^")
-    for c in commits:
-        if not STACK_INFO_RE.search(c.message):
-            c.message += f"\n\nstack-info: PR: {c.pr_url}, branch: {c.branch}"
-        fields = run("git", "show", "-s", "--format=%T%x00%an%x00%ae%x00%ad%x00%cn%x00%ce%x00%cd", "--date=raw", c.sha)
-        tree, an, ae, ad, cn, ce, cd = fields.split("\x00")
-        env = dict(os.environ, GIT_AUTHOR_NAME=an, GIT_AUTHOR_EMAIL=ae, GIT_AUTHOR_DATE=ad,
-                   GIT_COMMITTER_NAME=cn, GIT_COMMITTER_EMAIL=ce, GIT_COMMITTER_DATE=cd)  # fmt: skip
-        new_sha = subprocess.run(
-            ["git", "commit-tree", tree, "-p", parent, "-F", "-"],
-            input=c.message, capture_output=True, text=True, env=env, check=True,
-        ).stdout.strip()  # fmt: skip
-        if new_sha != c.sha:
-            rewritten.append((c.sha, new_sha))
-        c.sha = parent = new_sha
+    parent = run("git", "rev-parse", f"{prs[0].commits[0].sha}^")
+    for p in prs:
+        if not STACK_INFO_RE.search(p.commits[0].message):
+            p.commits[0].message += f"\n\nstack-info: PR: {p.pr_url}, branch: {p.branch}"
+        for c in p.commits:
+            parent = rebuild_commit(c, parent, rewritten)
     if not rewritten:
         return
 
@@ -163,18 +182,34 @@ def write_stack_info(commits: list[Commit]) -> None:
         run("git", "hook", "run", "--ignore-missing", f"--to-stdin={f.name}", "post-rewrite", "--", "rebase")
 
 
-def find_github_stacks(commits: list[Commit]) -> list[dict]:
+def rebuild_commit(c: Commit, parent: str, rewritten: list[tuple[str, str]]) -> str:
+    """Recreate `c` on `parent` with its (possibly edited) message; returns and records the new sha."""
+    fields = run("git", "show", "-s", "--format=%T%x00%an%x00%ae%x00%ad%x00%cn%x00%ce%x00%cd", "--date=raw", c.sha)
+    tree, an, ae, ad, cn, ce, cd = fields.split("\x00")
+    env = dict(os.environ, GIT_AUTHOR_NAME=an, GIT_AUTHOR_EMAIL=ae, GIT_AUTHOR_DATE=ad,
+               GIT_COMMITTER_NAME=cn, GIT_COMMITTER_EMAIL=ce, GIT_COMMITTER_DATE=cd)  # fmt: skip
+    new_sha = subprocess.run(
+        ["git", "commit-tree", tree, "-p", parent, "-F", "-"],
+        input=c.message, capture_output=True, text=True, env=env, check=True,
+    ).stdout.strip()  # fmt: skip
+    if new_sha != c.sha:
+        rewritten.append((c.sha, new_sha))
+    c.sha = new_sha
+    return new_sha
+
+
+def find_github_stacks(prs: list[Pr]) -> list[dict]:
     """Every native GitHub stack holding any of the already-submitted PRs. After a reorder
     or a partial submit the PRs can be spread over several stacks."""
-    def lookup(c: Commit) -> list[dict]:
-        return json.loads(run("gh", "api", f"repos/{{owner}}/{{repo}}/stacks?pull_request={c.pr_number}"))
+    def lookup(p: Pr) -> list[dict]:
+        return json.loads(run("gh", "api", f"repos/{{owner}}/{{repo}}/stacks?pull_request={p.pr_number}"))
 
     with ThreadPoolExecutor() as pool:
-        found = pool.map(lookup, [c for c in commits if c.pr_url])
+        found = pool.map(lookup, [p for p in prs if p.pr_url])
         return list({s["number"]: s for stacks in found for s in stacks}.values())
 
 
-def prepare_github_stack(commits: list[Commit], bases: list[str], target: str) -> dict | None:
+def prepare_github_stack(prs: list[Pr], bases: list[str], target: str) -> dict | None:
     """Unstack and retarget PRs whose base changes, before anything is pushed.
 
     GitHub marks a PR as merged once its base branch contains its head. After a
@@ -186,8 +221,8 @@ def prepare_github_stack(commits: list[Commit], bases: list[str], target: str) -
 
     Returns the existing stack if it can be extended, else None.
     """
-    stacks = find_github_stacks(commits)
-    ours = [c.pr_number if c.pr_url else None for c in commits]
+    stacks = find_github_stacks(prs)
+    ours = [p.pr_number if p.pr_url else None for p in prs]
     stack, start = None, 0
     if len(stacks) == 1 and [p["number"] for p in stacks[0]["pull_requests"]] == ours[: len(stacks[0]["pull_requests"])]:
         stack, start = stacks[0], len(stacks[0]["pull_requests"])
@@ -196,41 +231,41 @@ def prepare_github_stack(commits: list[Commit], bases: list[str], target: str) -
             print(f"Unstacking stack #{s['number']}")
             run("gh", "api", "-X", "POST", f"repos/{{owner}}/{{repo}}/stacks/{s['number']}/unstack")
 
-    def retarget(commit: Commit, base: str) -> None:
-        if commit.pr_url is None:
+    def retarget(pr: Pr, base: str) -> None:
+        if pr.pr_url is None:
             return
-        pr = json.loads(run("gh", "pr", "view", str(commit.pr_number), "--json", "baseRefName"))
-        if pr["baseRefName"] not in (base, target):
-            print(f"Retargeting {commit.pr_url} to {target}")
-            run("gh", "pr", "edit", str(commit.pr_number), "--base", target)
+        info = json.loads(run("gh", "pr", "view", str(pr.pr_number), "--json", "baseRefName"))
+        if info["baseRefName"] not in (base, target):
+            print(f"Retargeting {pr.pr_url} to {target}")
+            run("gh", "pr", "edit", str(pr.pr_number), "--base", target)
 
     with ThreadPoolExecutor() as pool:
-        list(pool.map(retarget, commits[start:], bases[start:]))
+        list(pool.map(retarget, prs[start:], bases[start:]))
     return stack
 
 
-def sync_github_stack(commits: list[Commit], bases: list[str], stack: dict | None) -> None:
+def sync_github_stack(prs: list[Pr], bases: list[str], stack: dict | None) -> None:
     """Fix PR bases, titles and bodies (with links to the other PRs), and make the PRs one native GitHub stack."""
-    prs = [c.pr_number for c in commits]
-    print(f"Syncing {len(commits)} PRs")
+    numbers = [p.pr_number for p in prs]
+    print(f"Syncing {len(prs)} PRs")
     with ThreadPoolExecutor() as pool:
-        list(pool.map(update_pr, commits, bases, [pr_body(c, commits) for c in commits]))
+        list(pool.map(update_pr, prs, bases, [pr_body(p, prs) for p in prs]))
 
-    if len(prs) < 2:
+    if len(numbers) < 2:
         return
     if stack:
-        new_prs = prs[len(stack["pull_requests"]) :]
-        if new_prs:
-            gh_post(f"repos/{{owner}}/{{repo}}/stacks/{stack['number']}/add", new_prs)
-        print(f"Stack #{stack['number']}: {commits[-1].pr_url}")
+        new_numbers = numbers[len(stack["pull_requests"]) :]
+        if new_numbers:
+            gh_post(f"repos/{{owner}}/{{repo}}/stacks/{stack['number']}/add", new_numbers)
+        print(f"Stack #{stack['number']}: {prs[-1].pr_url}")
     else:
-        number = gh_post("repos/{owner}/{repo}/stacks", prs)
-        print(f"Created stack #{number}: {commits[-1].pr_url}")
+        number = gh_post("repos/{owner}/{repo}/stacks", numbers)
+        print(f"Created stack #{number}: {prs[-1].pr_url}")
 
 
-def gh_post(path: str, prs: list[int]) -> str:
+def gh_post(path: str, numbers: list[int]) -> str:
     """POST a list of PR numbers to the stacks API; returns the stack number."""
-    body = json.dumps({"pull_requests": prs})
+    body = json.dumps({"pull_requests": numbers})
     return run("gh", "api", "-X", "POST", path, "--input", "-", "--jq", ".number", input=body)
 
 
@@ -245,21 +280,21 @@ def main() -> None:
     args = parser.parse_args()
     target = args.target or default_target(args.remote)
 
-    commits = read_stack(args.remote, target, args.prefix)
-    if not commits:
+    prs = read_stack(args.remote, target, args.prefix)
+    if not prs:
         sys.exit(f"Nothing to submit: HEAD is already in {args.remote}/{target}")
-    bases = [target] + [c.branch for c in commits[:-1]]
+    bases = [target] + [p.branch for p in prs[:-1]]
 
-    stack = prepare_github_stack(commits, bases, target)
-    push(commits, args.remote, args.no_verify)
-    new = [(c, base) for c, base in zip(commits, bases) if c.pr_url is None]
-    for c, base in new:  # in order, so each base branch has its PR before the next
-        create_pr(c, base, args.draft)
+    stack = prepare_github_stack(prs, bases, target)
+    push(prs, args.remote, args.no_verify)
+    new = [(p, base) for p, base in zip(prs, bases) if p.pr_url is None]
+    for p, base in new:  # in order, so each base branch has its PR before the next
+        create_pr(p, base, args.draft)
     if new:
-        write_stack_info(commits)
-        push(commits, args.remote, args.no_verify)
+        write_stack_info(prs)
+        push(prs, args.remote, args.no_verify)
 
-    sync_github_stack(commits, bases, stack)
+    sync_github_stack(prs, bases, stack)
 
 
 if __name__ == "__main__":

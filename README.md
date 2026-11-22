@@ -43,6 +43,19 @@ For each commit, bottom to top, it:
 
 Re-run it after any change to the stack (amend, reorder, rebase onto a new `master`).
 
+## Several commits in one PR
+
+To make a commit part of the PR below it instead of its own PR, replace its `stack-info` line with a
+bare one (stack-submit never writes this itself):
+
+```
+stack-info:
+```
+
+The commit joins the nearest PR below it, and that PR's branch then points at the topmost commit of the
+group. The PR's title and body still come from its first commit. Any PR the commit used to have is left
+open; close it by hand.
+
 ## Options
 
 All options can also be set per repository (or globally with `--global`) with git config:
